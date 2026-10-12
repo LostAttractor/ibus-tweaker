@@ -173,6 +173,13 @@ export class Source {
         constructor(enable = true) {
             super(() => global.stage.context.get_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE),
                 x => x.run_dispose(), enable); // run_dispose to release keys immediately
+            this.paste = new Source.Timer((keys, window, focus, text) => [() => {
+                let pending = this.paste.hub;
+                paste().then(value => {
+                    if(this.paste.hub === pending && value === text && global.display.focus_window === window &&
+                        global.stage.key_focus === focus && !global.stage.is_grabbed) this.stroke(keys);
+                }).catch(T.nop);
+            }, 100]);
         }
 
         stroke(keys) {
@@ -181,10 +188,24 @@ export class Source {
         }
 
         commit(text, focused = Source.Keyboard.focused) {
+            this.paste.dispel();
             let threshold = 1234; // max bytes: Wayland msg / UTF-8 char = 4000 / 3 = 1333.3 ~ 1234, see also https://github.com/whatwg/encoding/issues/333
-            let terminal = Main.inputMethod.contentPurpose === Clutter.InputContentPurpose.TERMINAL;
-            if(text.length < threshold && focused) Main.inputMethod.commit(terminal ? `\x1b[200~${text}\x1b[201~` : text); // Ref: https://en.wikipedia.org/wiki/Bracketed-paste
-            else copy(text), this.stroke([Clutter.KEY_Shift_L, ...terminal ? [Clutter.KEY_Control_L, Clutter.KEY_v] : [Clutter.KEY_Insert]]);
+            let window = global.display.focus_window;
+            let terminal = Main.inputMethod.contentPurpose === Clutter.InputContentPurpose.TERMINAL || window &&
+                Shell.WindowTracker.get_default().get_window_app(window)?.get_app_info()?.get_string('Categories')?.split(';').includes('TerminalEmulator');
+            if(text.length < threshold && focused) {
+                Main.inputMethod.commit(terminal ? `\x1b[200~${text}\x1b[201~` : text); // Ref: https://en.wikipedia.org/wiki/Bracketed-paste
+            } else {
+                copy(text);
+                // Let clients receive the new clipboard offer before handling the paste key.
+                // Shift+Insert reads PRIMARY in apps such as Ghostty, not CLIPBOARD.
+                this.paste.revive([Clutter.KEY_Control_L, ...terminal ? [Clutter.KEY_Shift_L] : [], Clutter.KEY_v], window, global.stage.key_focus, text);
+            }
+        }
+
+        destroy() {
+            this.paste.destroy();
+            super.destroy();
         }
     };
 
