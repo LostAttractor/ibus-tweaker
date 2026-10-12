@@ -245,11 +245,46 @@ class ClipPopup extends BoxPointer.BoxPointer {
         T.enrol(this);
     }
 
-    constructor(page, hooks) {
+    constructor(page, hooks, onKey, dismiss) {
         super(St.Side.TOP)[$].set({visible: false, reactive: true}).$buildWidgets(page, hooks);
+        let cover = new St.Widget({reactive: true})[$].add_constraint(new Clutter.BindConstraint({source: global.stage, coordinate: Clutter.BindCoordinate.ALL}))[$]
+            .add_action(new Clutter.ClickGesture()[$].connect('recognize', dismiss));
+        Main.layoutManager.addChrome(cover);
         Main.layoutManager.addChrome(this);
-        global.focusManager.add_group(this);
-        global.stage.set_key_focus(this);
+        F.Source.tie(this, cover, new F.Source.Handler(global.display, 'notify::focus-window', dismiss,
+            global.stage, 'notify::key-focus', 'notify::is-grabbed', dismiss, Main.overview, 'showing', dismiss, Main.sessionMode, 'updated', dismiss));
+        this.$captureKeys(onKey);
+    }
+
+    $captureKeys(onKey) {
+        // Mutter dispatches Wayland keys before stage captured-event handlers. Temporary
+        // accelerators let us handle them without a modal grab or changing client focus.
+        let events = [],
+            keys = new F.Source(() => {
+                let names = [...T.array(95, i => Clutter.keyval_name(Clutter.KEY_space + i)), ...T.array(35, i => `F${i + 1}`),
+                        ...T.array(Clutter.KEY_KP_Equal - Clutter.KEY_KP_Space + 1, i => Clutter.keyval_name(Clutter.KEY_KP_Space + i)).filter(T.id),
+                        'Return', 'KP_Enter', 'ISO_Enter', 'Escape', 'BackSpace', 'Delete', 'Insert', 'Home', 'End', 'Left', 'Right', 'Up', 'Down', 'Page_Up', 'Page_Down', 'Tab'],
+                    modifiers = ['<Shift>', '<Control>', '<Alt>', '<Super>'].reduce((mods, mod) => mods.flatMap(x => [x, x + mod]), ['']);
+                return names.flatMap(name => modifiers.flatMap(mods => {
+                    let action = global.display.grab_accelerator(mods + name, Meta.KeyBindingFlags.NONE);
+                    if(action === Meta.KeyBindingAction.NONE) return [];
+                    Main.wm.allowKeybinding(Meta.external_binding_name_for_action(action), Shell.ActionMode.NORMAL);
+                    return [action];
+                }));
+            }, actions => actions.forEach(action => {
+                global.display.ungrab_accelerator(action);
+                delete Main.wm._allowedKeybindings[Meta.external_binding_name_for_action(action)];
+            }), true),
+            dispatch = new F.Source.Timer(() => [() => {
+                // Release accelerators only after Mutter finishes using the current binding.
+                for(let event of events.splice(0)) if(keys.active) onKey(event);
+            }, 0]),
+            handler = new F.Source.Handler(global.display, 'accelerator-activated', (_d, action) => {
+                if(!keys.hub.includes(action)) return;
+                events.push(Clutter.get_current_event().copy());
+                dispatch.revive();
+            });
+        F.Source.tie(this, {handler, dispatch, keys});
     }
 
     $buildWidgets(page, hooks) {
@@ -271,7 +306,6 @@ class ClipPopup extends BoxPointer.BoxPointer {
         this._candidateArea.visible = true;
         this[$].setPosition(cursor, 0)[$].open(BoxPointer.PopupAnimation.NONE)
             .get_parent().set_child_above_sibling(this, null);
-        Main.pushModal(this, {actionMode: Shell.ActionMode.POPUP});
     }
 }
 
@@ -312,13 +346,11 @@ class ClipHistory extends F.Mortal {
                 ['next-page', () => this.navigate(this[K.CLPS])],
                 ['previous-page', () => this.navigate(-this[K.CLPS])],
                 ['candidate-clicked', (_a, x) => this.commit(this.addr + x)],
-            ])[$$].add_action([new Clutter.ClickGesture()[$].connect('recognize', () => this.$src.box.dispel()),
-                new Clutter.KeyController()[$].connect('key-press', (...xs) => this.$onKeyPress(...xs))])),
-            put = new F.Source.Timer(x => [() => kbd.commit(x, this.focused), 30]),
+            ], event => this.$onKeyPress(event), () => this.$src.box.dispel())),
             key = new F.Source.Keys(this.$set.hub, K.CKYS, () => this.summon(), true),
             csr = new Clutter.Actor({opacity: 0, x: 1, y: 1})[$_](x => Main.uiGroup.add_child(x)), // HACK: workaround for the cursor jumping
             dog = new F.Source.Handler(global.display.get_selection(), 'owner-changed', (...xs) => this.$onClipboardChange(...xs));
-        this.$src = F.Source.tie(this, {csr, box, put, kbd}, key, dog);
+        this.$src = F.Source.tie(this, {csr, box, kbd}, key, dog);
     }
 
     $onClipboardChange(_s, type, src) {
@@ -344,8 +376,8 @@ class ClipHistory extends F.Mortal {
         }).catch(T.nop);
     }
 
-    $onKeyPress(actor) {
-        let [, key] = actor.get_key();
+    $onKeyPress(event) {
+        let key = event.get_key_symbol();
         if(key >= Clutter.KEY_exclam && key <= Clutter.KEY_asciitilde) {
             if(key === Clutter.KEY_backslash) this.commit(this.pos, true);
             else if(key >= Clutter.KEY_0 && key <= Clutter.KEY_9) this.select(String.fromCodePoint(key));
@@ -365,23 +397,22 @@ class ClipHistory extends F.Mortal {
             case Clutter.KEY_Page_Down: this.navigate(this[K.CLPS]); break;
             case Clutter.KEY_Up:        this.navigate(-1); break;
             case Clutter.KEY_Down:      this.navigate(1); break;
-            case Clutter.KEY_Delete:    this.delete(F.held(actor, Clutter.ModifierType.SHIFT_MASK)); break;
+            case Clutter.KEY_Delete:    this.delete(!!(event.get_state() & Clutter.ModifierType.SHIFT_MASK)); break;
             case Clutter.KEY_BackSpace: this.updatePreedit(this.preedit.slice(0, -1)); break;
             case Clutter.KEY_Shift_L: break;
             default: this.$src.box.dispel(); break;
             }
         }
-        return Clutter.EVENT_STOP;
     }
 
     summon() {
-        if(this.$src.box.active) return;
-        this.focused = F.Source.Keyboard.focused;
+        if(this.$src.box.active || Main.actionMode !== Shell.ActionMode.NORMAL || !global.display.focus_window || global.stage.key_focus || global.stage.is_grabbed) return;
+        this.$src.kbd.paste.dispel();
         this.$src.box.summon();
         this.updatePreedit('');
         let {origin: {x, y}, size: {width, height}} = IBusPopup._dummyCursor.get_transformed_extents();
         let focused = global.display.focus_window?.get_frame_rect().contains_pointf(x, y);
-        if(!(this.focused || focused)) [x, y] = global.get_pointer(), width = height = Meta.prefs_get_cursor_size();
+        if(!(F.Source.Keyboard.focused || focused)) [x, y] = global.get_pointer(), width = height = Meta.prefs_get_cursor_size();
         this.$src.box.hub.summon(this.$src.csr[$].set_position(x, y)[$].set_size(width, height));
     }
 
@@ -410,7 +441,7 @@ class ClipHistory extends F.Mortal {
         let text = this.table[index]?.text;
         if(!text) return;
         if(copy) F.copy(text);
-        else this.$src.put.revive(text);
+        else this.$src.kbd.commit(text);
     }
 
     get db() { return ClipHistory.DB; }
