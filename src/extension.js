@@ -253,7 +253,23 @@ class ClipPopup extends BoxPointer.BoxPointer {
         Main.layoutManager.addChrome(this);
         F.Source.tie(this, cover, new F.Source.Handler(global.display, 'notify::focus-window', dismiss,
             global.stage, 'notify::key-focus', 'notify::is-grabbed', dismiss, Main.overview, 'showing', dismiss, Main.sessionMode, 'updated', dismiss));
+        this.$suspendInputMethod();
         this.$captureKeys(onKey);
+    }
+
+    $suspendInputMethod() {
+        let {visible} = IBusPopup, window = global.display.focus_window;
+        // Preserve unfinished composition and track candidate updates while hidden.
+        IBusPopup.close(BoxPointer.PopupAnimation.NONE);
+        F.Source.tie(this, new F.Source.Injector([Object.getPrototypeOf(Main.inputMethod), {
+            // Wayland sends keys to IBus before accelerators; bypass it for history.
+            vfunc_filter_key_event: () => false,
+        }, IBusPopup, {
+            open: () => { visible = true; },
+            close: (a, f, xs) => { visible = false; return f.apply(a, xs); },
+        }], true, () => {
+            if(visible && global.display.focus_window === window && !global.stage.key_focus && !global.stage.is_grabbed) IBusPopup._updateVisibility();
+        }));
     }
 
     $captureKeys(onKey) {
